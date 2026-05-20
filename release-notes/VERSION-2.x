@@ -24,6 +24,8 @@ a pure JSON library.
 #1602: `UTF8DataInputJsonParser` needs to enforce
   `StreamReadConstraints.maxNameLength` limit
  (fix by @cowtowncoder, w/ Claude code)
+#1611: Apply number-length validator on streaming integer path of async parser
+ (fix by @tonghuaroot)
 
 2.18.6 (22-Feb-2026)
 
