@@ -258,4 +258,71 @@ class AsyncNumberLengthConsistencyTest
             assertEquals(JsonToken.END_OBJECT, ap.nextToken());
         }
     }
+
+    /**
+     * Negative-number variant of the cross-chunk rejection test: a leading {@code '-'}
+     * routes through {@code _startNegativeNumber()} and the {@code negMod == -1} branch
+     * of {@code _finishNumberIntegralPart}, so the sign must be excluded from the
+     * validated digit length. With chunk size below {@code maxNumberLength}, the limit
+     * is only crossed after accumulating across several streaming suspensions.
+     */
+    @Test
+    void negativeIntegerPath_smallChunksAccumulate_rejectAtBoundary() throws Exception {
+        final int smallChunk = 100; // < MAX_NUM_LEN, so several chunks are needed
+        // Sign is excluded from the validated length, so the limit is crossed once the
+        // accumulated *digit* count exceeds MAX_NUM_LEN: 1000 ok at chunk 10, 1100 > 1000
+        // at chunk 11 (same boundary as the positive case).
+        final int expectedFailChunk = (MAX_NUM_LEN / smallChunk) + 1;
+
+        try (JsonParser ap = STRICT_F.createNonBlockingByteArrayParser()) {
+            ByteArrayFeeder feeder = (ByteArrayFeeder) ap;
+
+            // Note trailing '-': routes the value through the negative-number path.
+            byte[] preamble = utf8Bytes("{\"v\":-");
+            feeder.feedInput(preamble, 0, preamble.length);
+            JsonToken t;
+            while ((t = ap.nextToken()) != JsonToken.NOT_AVAILABLE) {
+                if (t == null) {
+                    fail("Parser ended unexpectedly while draining preamble");
+                }
+            }
+
+            byte[] digits = new byte[smallChunk];
+            for (int i = 0; i < digits.length; i++) {
+                digits[i] = (byte) ('1' + (i % 9));
+            }
+
+            int chunksFed = 0;
+            try {
+                for (int c = 0; c < MAX_CHUNKS; c++) {
+                    feeder.feedInput(digits, 0, digits.length);
+                    chunksFed++;
+                    JsonToken tt = ap.nextToken();
+                    if (tt != JsonToken.NOT_AVAILABLE) {
+                        fail("Expected NOT_AVAILABLE while streaming negative integer digits, got: " + tt);
+                    }
+                }
+                fail("Async parser accepted " + (smallChunk * MAX_CHUNKS)
+                        + " negative integer digits with maxNumberLength=" + MAX_NUM_LEN
+                        + "; expected StreamConstraintsException");
+            } catch (StreamConstraintsException e) {
+                String msg = String.valueOf(e.getMessage());
+                assertTrue(msg.contains("Number value length"),
+                        "Unexpected message: " + msg);
+                // Must accumulate across several chunks before firing...
+                assertTrue(chunksFed > 1,
+                        "Exception fired on a single chunk; cross-chunk accumulation not exercised");
+                // ...and fire at the same boundary as the positive case (sign excluded
+                // from the validated length), not one chunk earlier.
+                assertTrue(chunksFed >= expectedFailChunk,
+                        "StreamConstraintsException raised too early (sign likely counted): after "
+                                + chunksFed + " chunks of " + smallChunk
+                                + " (expected ~" + expectedFailChunk + ", maxNumberLength=" + MAX_NUM_LEN + ")");
+                assertTrue(chunksFed <= expectedFailChunk + 1,
+                        "StreamConstraintsException raised too late: after " + chunksFed
+                                + " chunks of " + smallChunk + " (expected ~" + expectedFailChunk
+                                + ", maxNumberLength=" + MAX_NUM_LEN + ")");
+            }
+        }
+    }
 }
