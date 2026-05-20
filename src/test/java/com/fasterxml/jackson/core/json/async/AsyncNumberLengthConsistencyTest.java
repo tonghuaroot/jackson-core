@@ -10,6 +10,7 @@ import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.core.async.ByteArrayFeeder;
 import com.fasterxml.jackson.core.exc.StreamConstraintsException;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -144,6 +145,117 @@ class AsyncNumberLengthConsistencyTest
                                 + " chunks of " + CHUNK_SIZE
                                 + " digits (maxNumberLength=" + MAX_NUM_LEN + ")");
             }
+        }
+    }
+
+    /**
+     * Pins the headline cross-chunk scenario directly: with a chunk size well below
+     * {@code maxNumberLength}, the limit is only crossed after several streaming
+     * suspensions, so this exercises accumulation inside {@code _finishNumberIntegralPart}
+     * (not just a single oversized first chunk). Asserts the exception fires at the
+     * expected boundary — after more than one chunk, but as soon as the limit is passed.
+     */
+    @Test
+    void integerPath_smallChunksAccumulate_rejectAtBoundary() throws Exception {
+        final int smallChunk = 100; // < MAX_NUM_LEN, so several chunks are needed
+        // Limit is crossed once accumulated digits exceed MAX_NUM_LEN; with 100-digit
+        // chunks that is the 11th chunk (1000 ok at chunk 10, 1100 > 1000 at chunk 11).
+        final int expectedFailChunk = (MAX_NUM_LEN / smallChunk) + 1;
+
+        try (JsonParser ap = STRICT_F.createNonBlockingByteArrayParser()) {
+            ByteArrayFeeder feeder = (ByteArrayFeeder) ap;
+
+            byte[] preamble = utf8Bytes("{\"v\":");
+            feeder.feedInput(preamble, 0, preamble.length);
+            JsonToken t;
+            while ((t = ap.nextToken()) != JsonToken.NOT_AVAILABLE) {
+                if (t == null) {
+                    fail("Parser ended unexpectedly while draining preamble");
+                }
+            }
+
+            byte[] digits = new byte[smallChunk];
+            for (int i = 0; i < digits.length; i++) {
+                digits[i] = (byte) ('1' + (i % 9));
+            }
+
+            int chunksFed = 0;
+            try {
+                for (int c = 0; c < MAX_CHUNKS; c++) {
+                    feeder.feedInput(digits, 0, digits.length);
+                    chunksFed++;
+                    JsonToken tt = ap.nextToken();
+                    if (tt != JsonToken.NOT_AVAILABLE) {
+                        fail("Expected NOT_AVAILABLE while streaming integer digits, got: " + tt);
+                    }
+                }
+                fail("Async parser accepted " + (smallChunk * MAX_CHUNKS)
+                        + " integer digits with maxNumberLength=" + MAX_NUM_LEN
+                        + "; expected StreamConstraintsException");
+            } catch (StreamConstraintsException e) {
+                String msg = String.valueOf(e.getMessage());
+                assertTrue(msg.contains("Number value length"),
+                        "Unexpected message: " + msg);
+                // Must accumulate across several chunks before firing...
+                assertTrue(chunksFed > 1,
+                        "Exception fired on a single chunk; cross-chunk accumulation not exercised");
+                // ...and fire as soon as the limit is passed, not arbitrarily later.
+                assertTrue(chunksFed <= expectedFailChunk + 1,
+                        "StreamConstraintsException raised too late: after " + chunksFed
+                                + " chunks of " + smallChunk + " (expected ~" + expectedFailChunk
+                                + ", maxNumberLength=" + MAX_NUM_LEN + ")");
+            }
+        }
+    }
+
+    /**
+     * Guards against the validator becoming over-eager: an integer whose length is
+     * just below {@code maxNumberLength}, fed across many small chunks (each smaller
+     * than the limit, so accumulation crosses several streaming-suspension points),
+     * must still parse cleanly to the expected value.
+     */
+    @Test
+    void integerPath_justUnderMaxNumberLength_parsesCleanly() throws Exception {
+        // One short of the limit, so the validator must NOT fire.
+        final int digitCount = MAX_NUM_LEN - 1;
+        StringBuilder sb = new StringBuilder(digitCount);
+        for (int i = 0; i < digitCount; i++) {
+            sb.append((char) ('1' + (i % 9)));
+        }
+        final String number = sb.toString();
+
+        try (JsonParser ap = STRICT_F.createNonBlockingByteArrayParser()) {
+            ByteArrayFeeder feeder = (ByteArrayFeeder) ap;
+
+            byte[] preamble = utf8Bytes("{\"v\":");
+            feeder.feedInput(preamble, 0, preamble.length);
+            JsonToken t;
+            while ((t = ap.nextToken()) != JsonToken.NOT_AVAILABLE) {
+                if (t == null) {
+                    fail("Parser ended unexpectedly while draining preamble");
+                }
+            }
+
+            // Feed the digits in small chunks (well under maxNumberLength) so the
+            // integer is accumulated across multiple _finishNumberIntegralPart resumes.
+            byte[] digits = utf8Bytes(number);
+            final int smallChunk = 100;
+            for (int off = 0; off < digits.length; off += smallChunk) {
+                int len = Math.min(smallChunk, digits.length - off);
+                feeder.feedInput(digits, off, off + len);
+                assertEquals(JsonToken.NOT_AVAILABLE, ap.nextToken(),
+                        "Expected NOT_AVAILABLE while streaming sub-limit integer digits");
+            }
+
+            // Terminate the value and signal end of input.
+            byte[] tail = utf8Bytes("}");
+            feeder.feedInput(tail, 0, tail.length);
+            feeder.endOfInput();
+
+            assertEquals(JsonToken.VALUE_NUMBER_INT, ap.nextToken(),
+                    "Sub-limit integer should parse without StreamConstraintsException");
+            assertEquals(number, ap.getText());
+            assertEquals(JsonToken.END_OBJECT, ap.nextToken());
         }
     }
 }
